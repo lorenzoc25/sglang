@@ -423,32 +423,44 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
             return InvalidGrammarObject(str(e))
         return self._from_context(ctx, key_string, GrammarStats(dispatch_type="regex"))
 
+    @classmethod
+    def parse_structural_tag(cls, key_string: str):
+        """Normalize tags for both syntax validation and scheduler compilation.
+
+        Legacy tags become a StructuralTag; modern tags remain serialized JSON.
+        Sanitization changes only privately decoded data, not the caller's request.
+        """
+        # TODO(dark): it's REALLY stupid to construct object from string and decode it again
+        structural_tag = json.loads(key_string)
+        if is_legacy_structural_tag(structural_tag):
+            cls._sanitize_structural_tag_structures(structural_tag)
+            tags = [
+                StructuralTagItem(
+                    begin=structure["begin"],
+                    schema=json.dumps(structure["schema"]),
+                    end=structure["end"],
+                )
+                for structure in structural_tag["structures"]
+            ]
+            new_tag = StructuralTag.from_legacy_structural_tag(
+                tags, structural_tag["triggers"]
+            )
+            new_tag.format.at_least_one = structural_tag.get("at_least_one", False)
+            return new_tag
+
+        format_dict = structural_tag.get("format")
+        if isinstance(format_dict, dict):
+            cls._sanitize_structural_format(format_dict)
+            structural_tag["format"] = format_dict
+            key_string = json.dumps(structural_tag)
+        return key_string
+
     def dispatch_structural_tag(self, key_string: str) -> BaseGrammarObject:
         try:
-            # TODO(dark): it's REALLY stupid to construct object from string and decode it again
-            structural_tag = json.loads(key_string)
-            if is_legacy_structural_tag(structural_tag):
-                self._sanitize_structural_tag_structures(structural_tag)
-                tags = [
-                    StructuralTagItem(
-                        begin=structure["begin"],
-                        schema=json.dumps(structure["schema"]),
-                        end=structure["end"],
-                    )
-                    for structure in structural_tag["structures"]
-                ]
-                new_tag = StructuralTag.from_legacy_structural_tag(
-                    tags, structural_tag["triggers"]
-                )
-                new_tag.format.at_least_one = structural_tag.get("at_least_one", False)
-                ctx = self.grammar_compiler.compile_structural_tag(new_tag)
-            else:
-                format_dict = structural_tag.get("format")
-                if isinstance(format_dict, dict):
-                    self._sanitize_structural_format(format_dict)
-                    structural_tag["format"] = format_dict
-                    key_string = json.dumps(structural_tag)
-                ctx = self.grammar_compiler.compile_structural_tag(key_string)
+            structural_tag = self.parse_structural_tag(key_string)
+            if isinstance(structural_tag, str):
+                key_string = structural_tag
+            ctx = self.grammar_compiler.compile_structural_tag(structural_tag)
         except (RuntimeError, json.decoder.JSONDecodeError) as e:
             logger.error(f"Hit invalid structural_tag: {key_string=}, {e=}")
             return InvalidGrammarObject(str(e))

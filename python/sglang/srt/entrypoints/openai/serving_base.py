@@ -5,17 +5,27 @@ import json
 import logging
 import uuid
 from abc import ABC, abstractmethod
+from functools import partial
 from typing import TYPE_CHECKING, Any, List, Optional, Tuple, Union
 
 import orjson
 from fastapi import HTTPException, Request
 from fastapi.responses import ORJSONResponse, StreamingResponse
 
+from sglang.srt.constrained.grammar_validation import (
+    InvalidGrammarError,
+    validate_grammar,
+)
 from sglang.srt.entrypoints.openai.encoding_dsv32 import DS32EncodingError
-from sglang.srt.entrypoints.openai.protocol import ErrorResponse, OpenAIServingRequest
+from sglang.srt.entrypoints.openai.protocol import (
+    ChatCompletionRequest,
+    CompletionRequest,
+    ErrorResponse,
+    OpenAIServingRequest,
+)
 from sglang.srt.managers.io_struct import EmbeddingReqInput, GenerateReqInput
 from sglang.srt.observability.req_time_stats import monotonic_time
-from sglang.srt.runtime_context import get_observability
+from sglang.srt.runtime_context import get_exec, get_observability, get_serving
 from sglang.srt.server_args import ServerArgs
 
 if TYPE_CHECKING:
@@ -102,6 +112,8 @@ class OpenAIServingBase(ABC):
             adapted_request, processed_request = await loop.run_in_executor(
                 None, self._convert_to_internal_request, request, raw_request
             )
+            if isinstance(request, (ChatCompletionRequest, CompletionRequest)):
+                await self._validate_grammar(adapted_request.sampling_params, request)
 
             if isinstance(adapted_request, (GenerateReqInput, EmbeddingReqInput)):
                 # Only set timing fields if adapted_request supports them
@@ -116,6 +128,8 @@ class OpenAIServingBase(ABC):
                 return await self._handle_non_streaming_request(
                     adapted_request, processed_request, raw_request
                 )
+        except InvalidGrammarError as e:
+            return self.create_error_response(str(e), param=e.field)
         except HTTPException as e:
             return self.create_error_response(
                 message=e.detail, err_type=str(e.status_code), status_code=e.status_code
@@ -201,6 +215,48 @@ class OpenAIServingBase(ABC):
     def _validate_request(self, _: OpenAIServingRequest) -> Optional[str]:
         """Validate request"""
         pass
+
+    async def _validate_grammar(
+        self, sampling_params: dict, request: OpenAIServingRequest
+    ):
+        """Reject normalized constraints before tokenizer dispatch.
+
+        Validate the final grammar after response-format/tool conversion, but
+        attribute failures to the original request field for the HTTP 400 response.
+        Only native parsing runs in a worker; unconstrained requests never yield.
+        """
+        backend = get_exec().kernel.grammar_backend
+        if backend == "none":
+            return
+
+        for field in ("json_schema", "regex", "ebnf", "structural_tag"):
+            key_string = sampling_params.get(field)
+            # SamplingParams normalizes empty constraint strings to None.
+            if not key_string:
+                continue
+            serving = get_serving()
+            error = await asyncio.get_running_loop().run_in_executor(
+                None,
+                partial(
+                    validate_grammar,
+                    backend,
+                    "json" if field == "json_schema" else field,
+                    key_string,
+                    any_whitespace=not serving.constrained_json_disable_any_whitespace,
+                    whitespace_pattern=serving.constrained_json_whitespace_pattern,
+                    max_whitespace_cnt=serving.constrained_json_max_whitespace_cnt,
+                ),
+            )
+            if not error:
+                continue
+
+            response_format = getattr(request, "response_format", None)
+            if response_format is not None and (
+                response_format.type == field
+                or (field == "json_schema" and response_format.type == "json_object")
+            ):
+                field = f"response_format {field}"
+            raise InvalidGrammarError(field, error)
 
     def create_error_response(
         self,

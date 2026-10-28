@@ -17,10 +17,12 @@ import json
 import unittest
 import uuid
 from http import HTTPStatus
+from itertools import product
 from typing import Optional
 from unittest.mock import Mock, patch
 
-from fastapi import Request
+from fastapi import FastAPI, Request
+from fastapi.testclient import TestClient
 from tokenizers import Tokenizer as BackendTokenizer
 from tokenizers import models as tokenizer_models
 from tokenizers import pre_tokenizers
@@ -29,10 +31,17 @@ from transformers.utils.chat_template_utils import _compile_jinja_template
 from xgrammar import Grammar
 from xgrammar.testing import _is_grammar_accept_string
 
+from sglang.srt.entrypoints.anthropic.protocol import (
+    AnthropicErrorResponse,
+    AnthropicMessagesRequest,
+)
+from sglang.srt.entrypoints.anthropic.serving import AnthropicServing
+from sglang.srt.entrypoints.openai import serving_base
 from sglang.srt.entrypoints.openai.chat_encoding import resolve_chat_encoding_spec
 from sglang.srt.entrypoints.openai.parallel_prompt_encode import encode_prompt_segments
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
+    CompletionRequest,
     Function,
     MessageProcessingResult,
     Tool,
@@ -43,6 +52,7 @@ from sglang.srt.entrypoints.openai.serving_chat import (
     OpenAIServingChat,
     normalize_tool_content,
 )
+from sglang.srt.entrypoints.openai.serving_completions import OpenAIServingCompletion
 from sglang.srt.environ import envs
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.function_call.kimik3_format import TOOLS_CLOSE, TOOLS_OPEN
@@ -390,6 +400,270 @@ class TestPythonChatTemplateSegments(CustomTestCase):
 
 
 class ServingChatTestCase(CustomTestCase):
+    def test_invalid_grammar_returns_http_400_before_generation(self):
+        self.template_manager.chat_template_name = "chatml"
+        self.tm.request_logger = Mock(log_requests=False)
+        self.tm.create_abort_task.return_value = None
+        dispatched = []
+        convert = self.chat._convert_to_internal_request
+        validate = serving_base.validate_grammar
+
+        def record_conversion(request, raw_request):
+            if raw_request.url.path == "/v1/messages":
+                asyncio.get_running_loop()
+            else:
+                with self.assertRaises(RuntimeError):
+                    asyncio.get_running_loop()
+            return convert(request, raw_request)
+
+        def record_validation(*args, **kwargs):
+            with self.assertRaises(RuntimeError):
+                asyncio.get_running_loop()
+            return validate(*args, **kwargs)
+
+        self.chat._convert_to_internal_request = record_conversion
+        self.enterContext(
+            patch.object(serving_base, "validate_grammar", record_validation)
+        )
+
+        async def generate(*args, **kwargs):
+            dispatched.append(True)
+            yield _spec_result(0)
+
+        self.tm.generate_request = generate
+        app = FastAPI()
+        anthropic = AnthropicServing(self.chat)
+        completion = OpenAIServingCompletion(self.tm, self.template_manager)
+        with get_context().override_server_args(grammar_backend="none"):
+            internal, _ = completion._convert_to_internal_request(
+                CompletionRequest(model="x", prompt="Hello", regex="[")
+            )
+            self.assertEqual(internal.sampling_params["regex"], "[")
+
+        @app.post("/v1/chat/completions")
+        async def chat(request: ChatCompletionRequest, raw_request: Request):
+            return await self.chat.handle_request(request, raw_request)
+
+        @app.post("/v1/completions")
+        async def completions(request: CompletionRequest, raw_request: Request):
+            return await completion.handle_request(request, raw_request)
+
+        @app.post("/v1/messages")
+        async def messages(request: AnthropicMessagesRequest, raw_request: Request):
+            return await anthropic.handle_messages(request, raw_request)
+
+        invalid_schema = {"type": "invalid"}
+        schema_format = {
+            "type": "json_schema",
+            "json_schema": {"name": "test", "schema": invalid_schema},
+        }
+        tag = {"begin": "<call>", "schema": invalid_schema, "end": "</call>"}
+        tag_format = {
+            "type": "structural_tag",
+            "structures": [tag],
+            "triggers": ["<call"],
+        }
+        modern_tag = {
+            "type": "structural_tag",
+            "format": {"type": "regex", "pattern": "["},
+        }
+        cases = (
+            ({"regex": "["}, "regex"),
+            ({"ebnf": "root ::= missing"}, "ebnf"),
+            ({"response_format": schema_format}, "response_format json_schema"),
+            ({"response_format": tag_format}, "response_format structural_tag"),
+            ({"response_format": modern_tag}, "response_format structural_tag"),
+        )
+        base = {"model": "x", "messages": [{"role": "user", "content": "Hello"}]}
+        output_config = {"format": {"type": "json_schema", "schema": invalid_schema}}
+        endpoints = (
+            ("/v1/chat/completions", base, cases),
+            (
+                "/v1/completions",
+                {"model": "x", "prompt": "Hello"},
+                (*cases, ({"json_schema": '{"type":"invalid"}'}, "json_schema")),
+            ),
+            (
+                "/v1/messages",
+                {**base, "max_tokens": 16},
+                (({"output_config": output_config}, "output_config.format"),),
+            ),
+        )
+        with TestClient(app) as client:
+            for backend, mode, stream in product(
+                ("xgrammar", "llguidance", "outlines"),
+                ("null", "prefill", "decode"),
+                (False, True),
+            ):
+                with get_context().override_server_args(
+                    grammar_backend=backend, disaggregation_mode=mode
+                ):
+                    for path, payload, invalid in endpoints:
+                        for fields, label in invalid:
+                            with self.subTest(
+                                case=(backend, mode, stream, path, label)
+                            ):
+                                response = client.post(
+                                    path, json={**payload, "stream": stream, **fields}
+                                )
+                                self.assertEqual(response.status_code, 400)
+                                self.assertEqual(
+                                    response.headers["content-type"], "application/json"
+                                )
+                                self.assertNotIn("data:", response.text)
+                                response_body = response.json()
+                                if path == "/v1/messages":
+                                    self.assertEqual(response_body["type"], "error")
+                                    error_response = (
+                                        AnthropicErrorResponse.model_validate(
+                                            response_body
+                                        )
+                                    )
+                                    self.assertEqual(
+                                        error_response.error.type,
+                                        "invalid_request_error",
+                                    )
+                                    message = error_response.error.message
+                                else:
+                                    self.assertEqual(
+                                        response_body["type"], "BadRequestError"
+                                    )
+                                    self.assertEqual(response_body["param"], label)
+                                    message = response_body["message"]
+                                self.assertIn(f"Invalid {label}", message)
+                                self.assertEqual(dispatched, [])
+
+                    response = client.post(
+                        "/v1/completions",
+                        json={
+                            "model": "x",
+                            "prompt": "Hello",
+                            "stream": stream,
+                            "regex": "(yes|no)",
+                        },
+                    )
+                    self.assertEqual(response.status_code, 200)
+                    self.assertEqual(dispatched, [True])
+                    dispatched.clear()
+
+    def test_messages_only_offloads_grammar_validation(self):
+        self.template_manager.chat_template_name = "chatml"
+        self.tm.create_abort_task.return_value = None
+        dispatched = []
+        convert = self.chat._convert_to_internal_request
+        validate = serving_base.validate_grammar
+
+        def record_conversion(*args):
+            asyncio.get_running_loop()
+            return convert(*args)
+
+        def record_validation(*args, **kwargs):
+            with self.assertRaises(RuntimeError):
+                asyncio.get_running_loop()
+            return validate(*args, **kwargs)
+
+        self.chat._convert_to_internal_request = record_conversion
+        self.enterContext(
+            patch.object(serving_base, "validate_grammar", record_validation)
+        )
+
+        async def generate(*args, **kwargs):
+            dispatched.append(True)
+            yield _spec_result(0)
+
+        self.tm.generate_request = generate
+        anthropic = AnthropicServing(self.chat)
+        app = FastAPI()
+
+        @app.post("/v1/messages")
+        async def messages(request: AnthropicMessagesRequest, raw_request: Request):
+            loop = asyncio.get_running_loop()
+            with patch.object(
+                loop, "run_in_executor", wraps=loop.run_in_executor
+            ) as worker:
+                response = await anthropic.handle_messages(request, raw_request)
+                self.assertEqual(worker.called, expect_worker)
+                return response
+
+        base = {
+            "model": "x",
+            "max_tokens": 16,
+            "messages": [{"role": "user", "content": "Hello"}],
+        }
+        invalid_format = {
+            "output_config": {
+                "format": {"type": "json_schema", "schema": {"type": "invalid"}}
+            }
+        }
+        # An unresolved reference passes tool-schema checks but fails native parsing.
+        tools = [
+            {
+                "name": "lookup",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {"value": {"$ref": "#/$defs/missing"}},
+                },
+                "strict": True,
+            }
+        ]
+        cases = (
+            ("unconstrained", {}, "xgrammar", 200, False),
+            (
+                "valid_format",
+                {
+                    "output_config": {
+                        "format": {"type": "json_schema", "schema": {"type": "object"}}
+                    }
+                },
+                "xgrammar",
+                200,
+                True,
+            ),
+            (
+                "named_tool_constraint",
+                {
+                    "tools": tools,
+                    "tool_choice": {"type": "tool", "name": "lookup"},
+                },
+                "xgrammar",
+                400,
+                True,
+            ),
+            (
+                "required_tool_constraint",
+                {"tools": tools, "tool_choice": {"type": "any"}},
+                "xgrammar",
+                400,
+                True,
+            ),
+            (
+                "unconstrained_tools",
+                {"tools": tools, "tool_choice": {"type": "none"}},
+                "xgrammar",
+                200,
+                False,
+            ),
+            ("disabled_backend", invalid_format, "none", 200, False),
+        )
+        with TestClient(app) as client:
+            for stream, case in product((False, True), cases):
+                name, fields, backend, status, expect_worker = case
+                with self.subTest(case=name, stream=stream):
+                    dispatched.clear()
+                    with get_context().override_server_args(grammar_backend=backend):
+                        response = client.post(
+                            "/v1/messages",
+                            json={**base, "stream": stream, **fields},
+                        )
+                    self.assertEqual(response.status_code, status)
+                    if status == 400:
+                        error = AnthropicErrorResponse.model_validate(response.json())
+                        self.assertEqual(error.error.type, "invalid_request_error")
+                        self.assertIn("Invalid ", error.error.message)
+                        self.assertEqual(dispatched, [])
+                    else:
+                        self.assertEqual(dispatched, [True])
+
     # ------------- common fixtures -------------
     def setUp(self):
         # The serving layer reads its config from the bags, so the fixture has

@@ -16,6 +16,7 @@ from fastapi import HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ValidationError
 
+from sglang.srt.constrained.grammar_validation import InvalidGrammarError
 from sglang.srt.entrypoints.anthropic.protocol import (
     AnthropicContentBlock,
     AnthropicCountTokensRequest,
@@ -763,6 +764,9 @@ class AnthropicServing:
                     chat_request, raw_request
                 )
             )
+            await self.openai_serving_chat._validate_grammar(
+                adapted_request.sampling_params, chat_request
+            )
             adapted_request.received_time = received_time
 
             # Get response from OpenAI handler
@@ -771,6 +775,8 @@ class AnthropicServing:
             )
         except asyncio.CancelledError:
             raise
+        except InvalidGrammarError as e:
+            return self._create_grammar_error_response(e, anthropic_request)
         except ValueError as e:
             return self._error_response(
                 status_code=400,
@@ -828,9 +834,14 @@ class AnthropicServing:
                     chat_request, raw_request
                 )
             )
+            await self.openai_serving_chat._validate_grammar(
+                adapted_request.sampling_params, chat_request
+            )
             adapted_request.received_time = received_time
         except asyncio.CancelledError:
             raise
+        except InvalidGrammarError as e:
+            return self._create_grammar_error_response(e, anthropic_request)
         except ValueError as e:
             return self._error_response(
                 status_code=400,
@@ -1355,6 +1366,22 @@ class AnthropicServing:
                 include_input=True,
                 include_output=True,
             ),
+        )
+
+    def _create_grammar_error_response(
+        self, error: InvalidGrammarError, request: AnthropicMessagesRequest
+    ) -> JSONResponse:
+        """Report early grammar errors against the original Messages format field."""
+        field = (
+            "output_config.format"
+            if request.output_config is not None
+            and request.output_config.format is not None
+            else error.field
+        )
+        return self._error_response(
+            status_code=400,
+            error_type="invalid_request_error",
+            message=f"Invalid {field}: {error.error}",
         )
 
     def _convert_openai_error_response(self, response) -> JSONResponse:

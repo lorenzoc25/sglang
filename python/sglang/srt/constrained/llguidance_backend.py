@@ -300,31 +300,35 @@ class GuidanceBackend(BaseGrammarBackend):
             logger.error(f"Hit invalid ebnf: {key_string=}, {e=}")
             return InvalidGrammarObject(str(e))
 
+    @staticmethod
+    def serialize_structural_tag(key_string: str) -> str:
+        """Serialize legacy tags for syntax validation and matcher compilation."""
+        structural_tag = json.loads(key_string)
+        assert is_legacy_structural_tag(structural_tag)
+        # Pair each structure with a trigger that prefixes its own
+        # ``begin`` — StructTag asserts begin.startswith(trigger), and
+        # detectors with per-tool triggers (e.g. Inkling's
+        # <|message_model|>{name}<|content_invoke_tool_json|>) emit a
+        # distinct trigger per tool, so triggers[0] matches only one of
+        # them and multi-tool grammars fail to compile.
+        triggers = structural_tag["triggers"]
+        tags = [
+            StructTag(
+                begin=structure["begin"],
+                grammar=structure["schema"],
+                end=structure["end"],
+                trigger=next(
+                    (t for t in triggers if structure["begin"].startswith(t)),
+                    triggers[0],
+                ),
+            )
+            for structure in structural_tag["structures"]
+        ]
+        return StructTag.to_grammar(tags)
+
     def dispatch_structural_tag(self, key_string: str) -> BaseGrammarObject:
         try:
-            structural_tag = json.loads(key_string)
-            assert is_legacy_structural_tag(structural_tag)
-            # Pair each structure with a trigger that prefixes its own
-            # ``begin`` — StructTag asserts begin.startswith(trigger), and
-            # detectors with per-tool triggers (e.g. Inkling's
-            # <|message_model|>{name}<|content_invoke_tool_json|>) emit a
-            # distinct trigger per tool, so triggers[0] matches only one of
-            # them and multi-tool grammars fail to compile.
-            triggers = structural_tag["triggers"]
-            tags = [
-                StructTag(
-                    begin=structure["begin"],
-                    grammar=structure["schema"],
-                    end=structure["end"],
-                    trigger=next(
-                        (t for t in triggers if structure["begin"].startswith(t)),
-                        triggers[0],
-                    ),
-                )
-                for structure in structural_tag["structures"]
-            ]
-            g = StructTag.to_grammar(tags)
-            return self._from_serialized(g)
+            return self._from_serialized(self.serialize_structural_tag(key_string))
         except Exception as e:
             logger.error(f"Hit invalid structural_tag: {key_string=}, {e=}")
             return InvalidGrammarObject(str(e))

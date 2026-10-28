@@ -73,7 +73,10 @@ class _FakeNonStreamingErrorOpenAI:
         return None
 
     def _convert_to_internal_request(self, chat_request, raw_request):
-        return SimpleNamespace(), chat_request
+        return SimpleNamespace(sampling_params={}), chat_request
+
+    async def _validate_grammar(self, sampling_params, chat_request):
+        pass
 
     async def _handle_non_streaming_request(
         self, adapted_request, processed_request, raw_request
