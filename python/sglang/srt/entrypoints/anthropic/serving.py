@@ -181,6 +181,32 @@ def _scrub_error_message(message: str, status_code: int) -> str:
     return cleaned or "Request failed"
 
 
+def _parse_upstream_error(data_str: str) -> Optional[tuple[Optional[int], str, str]]:
+    """Detect an OpenAI handler streaming-error envelope.
+
+    ``OpenAIServingChat.create_streaming_error_response`` emits
+    ``data: {"error": {"object":"error","message":"...",
+    "type":"BadRequestError","code":400}}``; the regular
+    ChatCompletionStreamResponse validator rejects it. Pull the
+    status/type/message out so the Anthropic client sees the real
+    failure instead of a generic 'Stream processing error'.
+    """
+    try:
+        payload = json.loads(data_str)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    err = payload.get("error")
+    if not isinstance(err, dict):
+        return None
+    upstream_message = err.get("message") or "Upstream error"
+    code = err.get("code")
+    if not isinstance(code, int):
+        return None, "api_error", str(upstream_message)
+    return code, ERROR_TYPE_MAP.get(code, "api_error"), str(upstream_message)
+
+
 class AnthropicServing:
     """Handler for Anthropic Messages API requests.
 
@@ -829,6 +855,12 @@ class AnthropicServing:
                 )
             )
             adapted_request.received_time = received_time
+            openai_stream = self.openai_serving_chat._generate_chat_stream(
+                adapted_request, processed_request, raw_request
+            )
+            # Read the first chunk before sending headers so a failure before
+            # any output answers with its HTTP status instead of a 200 stream.
+            first_chunk = await anext(openai_stream, None)
         except asyncio.CancelledError:
             raise
         except ValueError as e:
@@ -838,7 +870,7 @@ class AnthropicServing:
                 message=str(e),
             )
         except Exception as e:
-            logger.exception("Error converting streaming request: %s", e)
+            logger.exception("Error starting streaming request: %s", e)
             return self._error_response(
                 status_code=500,
                 error_type="api_error",
@@ -846,12 +878,26 @@ class AnthropicServing:
                 exception_name=type(e).__name__,
             )
 
+        if first_chunk is not None and first_chunk.startswith("data: "):
+            upstream = _parse_upstream_error(first_chunk[6:].strip())
+            if upstream is not None and upstream[0] is not None:
+                await openai_stream.aclose()
+                status_code, error_type, message = upstream
+                return self._error_response(
+                    status_code=status_code,
+                    error_type=error_type,
+                    message=_scrub_error_message(message, status_code),
+                )
+
+        async def stream_with_first_chunk():
+            if first_chunk is not None:
+                yield first_chunk
+            async for chunk in openai_stream:
+                yield chunk
+
         return StreamingResponse(
             self._generate_anthropic_stream(
-                adapted_request,
-                processed_request,
-                anthropic_request,
-                raw_request,
+                stream_with_first_chunk(), anthropic_request
             ),
             media_type="text/event-stream",
             background=self.openai_serving_chat.tokenizer_manager.create_abort_task(
@@ -861,16 +907,10 @@ class AnthropicServing:
 
     async def _generate_anthropic_stream(
         self,
-        adapted_request,
-        processed_request: ChatCompletionRequest,
+        openai_stream: AsyncGenerator[str, None],
         anthropic_request: AnthropicMessagesRequest,
-        raw_request: Request,
     ) -> AsyncGenerator[str, None]:
         """Convert OpenAI chat stream to Anthropic event stream."""
-        openai_stream = self.openai_serving_chat._generate_chat_stream(
-            adapted_request, processed_request, raw_request
-        )
-
         content_block_index = 0
         content_block_open = False
         content_block_type: Optional[str] = None
@@ -993,34 +1033,6 @@ class AnthropicServing:
             frames.append(_emit(MessageStopEvent()))
             return frames
 
-        def _parse_upstream_error(data_str: str) -> Optional[tuple[str, str]]:
-            """Detect an OpenAI handler streaming-error envelope.
-
-            ``OpenAIServingChat.create_streaming_error_response`` emits
-            ``data: {"error": {"object":"error","message":"...",
-            "type":"BadRequestError","code":400}}``; the regular
-            ChatCompletionStreamResponse validator rejects it. Pull the
-            type/message out so the Anthropic client sees the real
-            failure instead of a generic 'Stream processing error'.
-            """
-            try:
-                payload = json.loads(data_str)
-            except (json.JSONDecodeError, ValueError):
-                return None
-            if not isinstance(payload, dict):
-                return None
-            err = payload.get("error")
-            if not isinstance(err, dict):
-                return None
-            upstream_message = err.get("message") or "Upstream error"
-            code = err.get("code")
-            error_type = (
-                ERROR_TYPE_MAP.get(code, "api_error")
-                if isinstance(code, int)
-                else "api_error"
-            )
-            return error_type, str(upstream_message)
-
         # Pre-first-chunk errors from the OpenAI generator (e.g. tokenization
         # failure that raises ValueError before any chunk is yielded) would
         # otherwise abort the StreamingResponse with no envelope at all and
@@ -1119,7 +1131,7 @@ class AnthropicServing:
                 # error".
                 upstream = _parse_upstream_error(data_str)
                 if upstream is not None:
-                    error_type, error_message = upstream
+                    _, error_type, error_message = upstream
                     logger.warning(
                         "Forwarding upstream stream error (%s): %s",
                         error_type,

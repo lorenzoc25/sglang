@@ -4156,6 +4156,62 @@ class ServingChatTestCase(CustomTestCase):
         self.assertEqual(len(chunks), 2)
         self.assertIn("error", chunks[0])
 
+    def test_messages_stream_abort_before_output_returns_http_status(self):
+        """A Messages stream whose request aborts before any output (e.g. a grammar
+        that fails to compile) must answer with the abort's HTTP status, not 200."""
+        from sglang.srt.entrypoints.anthropic.protocol import AnthropicMessagesRequest
+        from sglang.srt.entrypoints.anthropic.serving import AnthropicServing
+
+        err_msg = "Failed to compile regex grammar: unbalanced parenthesis"
+
+        async def _mock_generate_abort():
+            yield {
+                "text": "",
+                "meta_info": {
+                    "id": "chatcmpl-test",
+                    "prompt_tokens": 10,
+                    "completion_tokens": 0,
+                    "cached_tokens": 0,
+                    "finish_reason": {
+                        "type": "abort",
+                        "status_code": HTTPStatus.BAD_REQUEST,
+                        "message": err_msg,
+                    },
+                },
+                "index": 0,
+            }
+
+        self.tm.generate_request.return_value = _mock_generate_abort()
+        self.tm.create_abort_task.return_value = None
+        anthropic_request = AnthropicMessagesRequest(
+            model="x",
+            max_tokens=16,
+            messages=[{"role": "user", "content": "Hi?"}],
+            stream=True,
+        )
+        chat_request = ChatCompletionRequest(
+            model="x",
+            max_tokens=16,
+            messages=[{"role": "user", "content": "Hi?"}],
+            stream=True,
+        )
+
+        with patch(
+            "sglang.srt.entrypoints.openai.serving_chat.generate_chat_conv"
+        ) as conv_mock:
+            conv_mock.return_value.get_prompt.return_value = "Test prompt"
+            response = get_or_create_event_loop().run_until_complete(
+                AnthropicServing(self.chat)._handle_streaming(
+                    chat_request, anthropic_request, self.fastapi_request
+                )
+            )
+
+        self.assertEqual(response.status_code, 400)
+        payload = json.loads(response.body)
+        self.assertEqual(payload["type"], "error")
+        self.assertEqual(payload["error"]["type"], "invalid_request_error")
+        self.assertEqual(payload["error"]["message"], err_msg)
+
     def test_streaming_abort_with_ids_enabled(self):
         """Test that a terminal abort with input/output ids enabled yields only an error and [DONE]."""
         err_msg = "Aborted by scheduler"

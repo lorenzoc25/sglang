@@ -119,10 +119,12 @@ def _choice(delta, finish_reason=None):
 async def _collect_anthropic_events(serving, anthropic_request):
     events = []
     async for sse in serving._generate_anthropic_stream(
-        adapted_request=object(),
-        processed_request=object(),
+        openai_stream=serving.openai_serving_chat._generate_chat_stream(
+            adapted_request=object(),
+            processed_request=object(),
+            raw_request=object(),
+        ),
         anthropic_request=anthropic_request,
-        raw_request=object(),
     ):
         for line in sse.splitlines():
             if line.startswith("data: "):
@@ -1418,6 +1420,94 @@ class TestAnthropicServing(unittest.TestCase):
         self.assertEqual(err["error"]["type"], "invalid_request_error")
         self.assertIn("tokenization failed", err["error"]["message"])
         self.assertEqual(types[-1], "message_stop")
+
+    def test_stream_failure_before_output_returns_http_status(self):
+        """A stream that fails before any output must answer with its HTTP status,
+        not a 200 SSE stream; a normal first chunk must still reach the client."""
+
+        class _StreamingOpenAI(_FakeOpenAIServingChat):
+            def __init__(self, stream_lines=None, error=None):
+                super().__init__(stream_lines)
+                self.tokenizer_manager.create_abort_task = lambda adapted_request: None
+                self.error = error
+
+            def _validate_request(self, chat_request):
+                return None
+
+            def _convert_to_internal_request(self, chat_request, raw_request):
+                return SimpleNamespace(), chat_request
+
+            def _generate_chat_stream(
+                self, adapted_request, processed_request, raw_request
+            ):
+                stream = super()._generate_chat_stream(
+                    adapted_request, processed_request, raw_request
+                )
+                if self.error is None:
+                    return stream
+
+                async def _gen():
+                    raise self.error
+                    yield  # pragma: no cover
+
+                return _gen()
+
+        def abort(code, message):
+            error = {"object": "error", "message": message, "code": code}
+            return f"data: {json.dumps({'error': error})}\n\n"
+
+        chat_request = ChatCompletionRequest(
+            model="test-model",
+            max_tokens=16,
+            messages=[{"role": "user", "content": "hello"}],
+            stream=True,
+        )
+        for name, openai, status, error_type, message in (
+            (
+                "queue full",
+                _StreamingOpenAI([abort(503, "queue full")]),
+                503,
+                "overloaded_error",
+                "Internal server error",
+            ),
+            (
+                "raised before output",
+                _StreamingOpenAI(error=ValueError("tokenization failed")),
+                400,
+                "invalid_request_error",
+                "tokenization failed",
+            ),
+        ):
+            with self.subTest(name):
+                response = asyncio.run(
+                    AnthropicServing(openai)._handle_streaming(
+                        chat_request, self._anthropic_request(), object()
+                    )
+                )
+                self.assertEqual(response.status_code, status)
+                payload = json.loads(response.body)
+                self.assertEqual(payload["type"], "error")
+                self.assertEqual(payload["error"]["type"], error_type)
+                self.assertEqual(payload["error"]["message"], message)
+
+        serving = AnthropicServing(
+            _StreamingOpenAI(
+                [
+                    _chunk([_choice({"role": "assistant", "content": "hi"})]),
+                    _chunk([_choice({}, finish_reason="stop")]),
+                    "data: [DONE]\n\n",
+                ]
+            )
+        )
+
+        async def stream_body():
+            response = await serving._handle_streaming(
+                chat_request, self._anthropic_request(), object()
+            )
+            self.assertEqual(response.status_code, 200)
+            return "".join([chunk async for chunk in response.body_iterator])
+
+        self.assertIn('"text":"hi"', asyncio.run(stream_body()))
 
     def test_server_tool_only_with_tool_choice_any_raises_400(self):
         """A request with only server-side tools cannot honor tool_choice=any."""
